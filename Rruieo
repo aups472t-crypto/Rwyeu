@@ -1,0 +1,655 @@
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+if CoreGui:FindFirstChild("VoxelUtilityUI") then
+	CoreGui.VoxelUtilityUI:Destroy()
+end
+
+local espEnabled = false
+local autoHealEnabled = false
+local isMeteorRunning = false
+local supernovaAimActive = false
+local isSupernovaRunning = false
+local isRewinding = false
+local rewindSeconds = 5 -- ปรับได้ตั้งแต่ 1 ถึง 20 วินาที
+local healConn = nil
+
+-- ประวัติตำแหน่งสำหรับฟังก์ชันย้อนเวลา (เก็บย้อนหลังสูงสุด 21 วินาที)
+local historyLog = {}
+local maxHistorySeconds = 21
+
+RunService.Heartbeat:Connect(function()
+	if isRewinding then return end
+	local char = LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if root and hum and hum.Health > 0 then
+		table.insert(historyLog, {
+			t = os.clock(),
+			cf = root.CFrame,
+			camCf = Camera.CFrame
+		})
+		local cutoff = os.clock() - maxHistorySeconds
+		while #historyLog > 0 and historyLog[1].t < cutoff do
+			table.remove(historyLog, 1)
+		end
+	end
+end)
+
+-- ฟังก์ชัน ESP
+local function applyHighlight(character)
+	if not character then return end
+	local existing = character:FindFirstChild("VoxelESP_Highlight")
+	if espEnabled then
+		if not existing then
+			local highlight = Instance.new("Highlight")
+			highlight.Name = "VoxelESP_Highlight"
+			highlight.FillColor = Color3.fromRGB(255, 60, 60)
+			highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+			highlight.FillTransparency = 0.5
+			highlight.OutlineTransparency = 0
+			highlight.Adornee = character
+			highlight.Parent = character
+		end
+	else
+		if existing then
+			existing:Destroy()
+		end
+	end
+end
+
+local function updateAllESP()
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			applyHighlight(player.Character)
+		end
+	end
+end
+
+local function setupPlayer(player)
+	if player == LocalPlayer then return end
+	player.CharacterAdded:Connect(function(char)
+		char:WaitForChild("HumanoidRootPart", 10)
+		applyHighlight(char)
+	end)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+	setupPlayer(player)
+end
+Players.PlayerAdded:Connect(setupPlayer)
+
+-- ฟังก์ชันรีเซ็ตเลือดฝั่ง Local
+local function refillLocalHealth()
+	local char = LocalPlayer.Character
+	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		if humanoid.MaxHealth <= 0 then
+			humanoid.MaxHealth = 100
+		end
+		if humanoid.Health < humanoid.MaxHealth then
+			humanoid.Health = humanoid.MaxHealth
+		end
+	end
+end
+
+local function bindAutoHeal(character)
+	if healConn then
+		healConn:Disconnect()
+		healConn = nil
+	end
+	local humanoid = character and character:WaitForChild("Humanoid", 10)
+	if not humanoid then return end
+
+	healConn = humanoid.HealthChanged:Connect(function(newHealth)
+		if autoHealEnabled and newHealth < humanoid.MaxHealth then
+			task.defer(function()
+				if autoHealEnabled and humanoid and humanoid.Parent then
+					humanoid.Health = humanoid.MaxHealth
+				end
+			end)
+		end
+	end)
+end
+
+if LocalPlayer.Character then
+	bindAutoHeal(LocalPlayer.Character)
+end
+LocalPlayer.CharacterAdded:Connect(bindAutoHeal)
+
+-- สร้างหน้าต่าง UI หลัก
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "VoxelUtilityUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = CoreGui
+
+local function makeBanner(text, bgColor, textColor, posY)
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0, 360, 0, 50)
+	label.Position = UDim2.new(0.5, -180, posY, 0)
+	label.BackgroundColor3 = bgColor
+	label.BackgroundTransparency = 0.15
+	label.Text = text
+	label.TextColor3 = textColor
+	label.Font = Enum.Font.GothamBlack
+	label.TextSize = 23
+	label.Visible = false
+	label.Parent = ScreenGui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = label
+	return label
+end
+
+local MeteorBanner = makeBanner("meteor shower!", Color3.fromRGB(25, 25, 30), Color3.fromRGB(255, 190, 50), 0.12)
+local NovaBanner = makeBanner("The developer destroyed it!", Color3.fromRGB(18, 12, 32), Color3.fromRGB(120, 220, 255), 0.19)
+local RewindBanner = makeBanner("Turn back time", Color3.fromRGB(20, 28, 38), Color3.fromRGB(140, 240, 210), 0.26)
+
+local function showBanner(label, duration)
+	label.Visible = true
+	task.delay(duration, function()
+		if label and label.Parent then
+			label.Visible = false
+		end
+	end)
+end
+
+-- ตัวชี้จุดเล็งซูเปอร์โนวาบนพื้น
+local aimRing = Instance.new("Part")
+aimRing.Name = "SupernovaAimMarker"
+aimRing.Shape = Enum.PartType.Cylinder
+aimRing.Size = Vector3.new(0.35, 16, 16)
+aimRing.Material = Enum.Material.Neon
+aimRing.Color = Color3.fromRGB(80, 210, 255)
+aimRing.Transparency = 0.5
+aimRing.Anchored = true
+aimRing.CanCollide = false
+aimRing.CastShadow = false
+aimRing.Parent = nil
+
+-- ฟังก์ชันระเบิดพื้นที่แบบเบาลง (ไม่ทำดาเมจกับตัวละครเราเอง)
+local function detonateArea(position, radius, force, destroyBlocks)
+	local exp = Instance.new("Explosion")
+	exp.Position = position
+	exp.BlastRadius = radius
+	exp.BlastPressure = force
+	exp.DestroyJointRadiusPercent = 0
+	exp.Parent = workspace
+
+	local myChar = LocalPlayer.Character
+	local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+	local prevHealth = myHum and myHum.Health
+
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	if myChar then
+		params.FilterDescendantsInstances = {myChar, aimRing}
+	else
+		params.FilterDescendantsInstances = {aimRing}
+	end
+
+	local parts = workspace:GetPartBoundsInRadius(position, radius, params)
+	for _, part in ipairs(parts) do
+		if part:IsA("BasePart") and not part.Locked then
+			if destroyBlocks and part.Size.Magnitude < 45 then
+				part.Anchored = false
+				part:BreakJoints()
+			end
+		end
+	end
+
+	if myHum and prevHealth and myHum.Health < prevHealth then
+		myHum.Health = prevHealth
+	end
+end
+
+-- ฟังก์ชันฝนดาวตก
+local function triggerMeteorShower()
+	if isMeteorRunning then return end
+	isMeteorRunning = true
+
+	showBanner(MeteorBanner, 3)
+
+	local endTime = os.clock() + 10
+	task.spawn(function()
+		while os.clock() < endTime do
+			for _ = 1, 2 do
+				local char = LocalPlayer.Character
+				local root = char and char:FindFirstChild("HumanoidRootPart")
+				if root then
+					local spreadX = math.random(-75, 75)
+					local spreadZ = math.random(-75, 75)
+					local spawnPos = root.Position + Vector3.new(spreadX + math.random(-15, 15), 95, spreadZ + math.random(-15, 15))
+					local fallDir = (Vector3.new(root.Position.X + spreadX, root.Position.Y - 25, root.Position.Z + spreadZ) - spawnPos).Unit
+
+					local meteor = Instance.new("Part")
+					meteor.Shape = Enum.PartType.Ball
+					meteor.Size = Vector3.new(3, 3, 3)
+					meteor.Material = Enum.Material.Neon
+					meteor.Color = Color3.fromRGB(255, 105, 25)
+					meteor.Position = spawnPos
+					meteor.Anchored = true
+					meteor.CanCollide = false
+					meteor.Parent = workspace
+
+					task.spawn(function()
+						local speed = 95
+						local maxLife = 3.5
+						local elapsed = 0
+
+						while meteor.Parent and elapsed < maxLife do
+							local dt = RunService.RenderStepped:Wait()
+							elapsed += dt
+
+							local stepDist = speed * dt
+							local rayParams = RaycastParams.new()
+							rayParams.FilterType = Enum.RaycastFilterType.Exclude
+							rayParams.FilterDescendantsInstances = {meteor, aimRing, LocalPlayer.Character}
+
+							local hit = workspace:Raycast(meteor.Position, fallDir * (stepDist + 1.5), rayParams)
+							if hit then
+								meteor.Position = hit.Position
+								detonateArea(hit.Position, 12, 180000, true)
+								meteor:Destroy()
+								break
+							else
+								meteor.Position += fallDir * stepDist
+							end
+						end
+
+						if meteor.Parent then
+							meteor:Destroy()
+						end
+					end)
+				end
+			end
+			task.wait(0.22)
+		end
+		isMeteorRunning = false
+	end)
+end
+
+-- ฟังก์ชันจุดเล็งและเสกซูเปอร์โนวา
+local function getAimTargetPosition()
+	local viewportCenter = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y * 0.5)
+	local ray = Camera:ViewportPointToRay(viewportCenter.X, viewportCenter.Y)
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.FilterDescendantsInstances = {aimRing, LocalPlayer.Character}
+
+	local result = workspace:Raycast(ray.Origin, ray.Direction * 900, rayParams)
+	if result then
+		return result.Position
+	end
+	return ray.Origin + ray.Direction * 220
+end
+
+local function triggerSupernova(targetPos)
+	if isSupernovaRunning then return end
+	isSupernovaRunning = true
+	supernovaAimActive = false
+	aimRing.Parent = nil
+
+	showBanner(NovaBanner, 4)
+
+	local originalCameraType = Camera.CameraType
+	local originalCFrame = Camera.CFrame
+	Camera.CameraType = Enum.CameraType.Scriptable
+
+	local novaCore = Instance.new("Part")
+	novaCore.Shape = Enum.PartType.Ball
+	novaCore.Size = Vector3.new(4, 4, 4)
+	novaCore.Material = Enum.Material.Neon
+	novaCore.Color = Color3.fromRGB(130, 225, 255)
+	novaCore.Position = targetPos + Vector3.new(0, 55, 0)
+	novaCore.Anchored = true
+	novaCore.CanCollide = false
+	novaCore.Parent = workspace
+
+	local shockwave = Instance.new("Part")
+	shockwave.Shape = Enum.PartType.Ball
+	shockwave.Size = Vector3.new(6, 6, 6)
+	shockwave.Material = Enum.Material.ForceField
+	shockwave.Color = Color3.fromRGB(90, 200, 255)
+	shockwave.Position = targetPos
+	shockwave.Anchored = true
+	shockwave.CanCollide = false
+	shockwave.Transparency = 0.45
+	shockwave.Parent = workspace
+
+	task.spawn(function()
+		local elapsed = 0
+		local duration = 2.2
+		while elapsed < duration do
+			local dt = RunService.RenderStepped:Wait()
+			elapsed += dt
+
+			local progress = math.clamp(elapsed / duration, 0, 1)
+			novaCore.Position = (targetPos + Vector3.new(0, 55, 0)):Lerp(targetPos, progress)
+			novaCore.Size = Vector3.new(4, 4, 4) + Vector3.new(14, 14, 14) * progress
+
+			local waveScale = 6 + (65 * progress)
+			shockwave.Size = Vector3.new(waveScale, waveScale, waveScale)
+			shockwave.Transparency = math.clamp(0.45 + progress * 0.5, 0, 1)
+
+			local camPos = targetPos + Vector3.new(math.cos(elapsed * 1.2) * 65, 42, math.sin(elapsed * 1.2) * 65)
+			local shake = Vector3.new(math.random(-1, 1), math.random(-1, 1), math.random(-1, 1)) * 0.15
+			Camera.CFrame = CFrame.lookAt(camPos + shake, targetPos)
+		end
+
+		detonateArea(targetPos, 32, 450000, true)
+		novaCore:Destroy()
+		shockwave:Destroy()
+
+		Camera.CameraType = originalCameraType
+		Camera.CFrame = originalCFrame
+		isSupernovaRunning = false
+	end)
+end
+
+-- ฟังก์ชันย้อนเวลาตามจำนวนวินาทีที่ตั้งไว้ (1 - 20 วินาที)
+local function triggerRewindTime()
+	if isRewinding or #historyLog < 2 then return end
+	isRewinding = true
+
+	showBanner(RewindBanner, 2.5)
+
+	local now = os.clock()
+	local targetTime = now - rewindSeconds
+	local startIndex = #historyLog
+	local endIndex = 1
+
+	for i = #historyLog, 1, -1 do
+		if historyLog[i].t <= targetTime then
+			endIndex = i
+			break
+		end
+	end
+
+	local snapshots = {}
+	for i = startIndex, endIndex, -1 do
+		table.insert(snapshots, historyLog[i])
+	end
+
+	-- กระชับจำนวนเฟรมถ้าย้อนนานหลายวินาที เพื่อให้ย้อนเสร็จในเวลาที่ลื่นและไม่ค้าง
+	local step = math.max(1, math.ceil(#snapshots / 110))
+	local sampled = {}
+	for i = 1, #snapshots, step do
+		table.insert(sampled, snapshots[i])
+	end
+	if #snapshots > 0 and sampled[#sampled] ~= snapshots[#snapshots] then
+		table.insert(sampled, snapshots[#snapshots])
+	end
+
+	local char = LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local prevCamType = Camera.CameraType
+
+	if root and hum then
+		local prevAutoRotate = hum.AutoRotate
+		hum.AutoRotate = false
+		root.Anchored = true
+		Camera.CameraType = Enum.CameraType.Scriptable
+
+		for _, snap in ipairs(sampled) do
+			if not root.Parent then break end
+			root.CFrame = snap.cf
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			Camera.CFrame = snap.camCf
+			RunService.RenderStepped:Wait()
+		end
+
+		Camera.CameraType = prevCamType
+		root.Anchored = false
+		hum.AutoRotate = prevAutoRotate
+	end
+
+	while #historyLog >= endIndex do
+		table.remove(historyLog)
+	end
+
+	isRewinding = false
+end
+
+RunService.RenderStepped:Connect(function()
+	if supernovaAimActive and not isSupernovaRunning then
+		local pos = getAimTargetPosition()
+		aimRing.Parent = workspace
+		aimRing.CFrame = CFrame.new(pos + Vector3.new(0, 0.25, 0)) * CFrame.Angles(0, 0, math.rad(90))
+	else
+		aimRing.Parent = nil
+	end
+end)
+
+-- ปุ่มยืนยันจุดปล่อยซูเปอร์โนวา
+local FireNovaBtn = Instance.new("TextButton")
+FireNovaBtn.Size = UDim2.new(0, 190, 0, 44)
+FireNovaBtn.Position = UDim2.new(0.5, -95, 0.78, 0)
+FireNovaBtn.BackgroundColor3 = Color3.fromRGB(30, 140, 220)
+FireNovaBtn.Text = "ปล่อยซูเปอร์โนวา!"
+FireNovaBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+FireNovaBtn.Font = Enum.Font.GothamBold
+FireNovaBtn.TextSize = 15
+FireNovaBtn.Visible = false
+FireNovaBtn.Parent = ScreenGui
+
+local FireNovaCorner = Instance.new("UICorner")
+FireNovaCorner.CornerRadius = UDim.new(0, 10)
+FireNovaCorner.Parent = FireNovaBtn
+
+-- หน้าต่างควบคุมหลัก
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 245, 0, 376)
+MainFrame.Position = UDim2.new(0.5, -122, 0.16, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 8)
+UICorner.Parent = MainFrame
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -30, 0, 30)
+Title.Position = UDim2.new(0, 10, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "Voxel Front Helper"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 14
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = MainFrame
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 26, 0, 26)
+CloseBtn.Position = UDim2.new(1, -29, 0, 3)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+CloseBtn.Text = "X"
+CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 13
+CloseBtn.Parent = MainFrame
+
+local CloseCorner = Instance.new("UICorner")
+CloseCorner.CornerRadius = UDim.new(0, 6)
+CloseCorner.Parent = CloseBtn
+
+local ModeBtn = Instance.new("TextButton")
+ModeBtn.Size = UDim2.new(0.48, -12, 0, 36)
+ModeBtn.Position = UDim2.new(0, 10, 0, 36)
+ModeBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 85)
+ModeBtn.Text = "โหมด: กดเอง"
+ModeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ModeBtn.Font = Enum.Font.GothamSemibold
+ModeBtn.TextSize = 12
+ModeBtn.Parent = MainFrame
+
+local ModeCorner = Instance.new("UICorner")
+ModeCorner.CornerRadius = UDim.new(0, 6)
+ModeCorner.Parent = ModeBtn
+
+local HealBtn = Instance.new("TextButton")
+HealBtn.Size = UDim2.new(0.48, -12, 0, 36)
+HealBtn.Position = UDim2.new(0.5, 2, 0, 36)
+HealBtn.BackgroundColor3 = Color3.fromRGB(40, 150, 100)
+HealBtn.Text = "รีเซ็ตเลือดเต็ม"
+HealBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+HealBtn.Font = Enum.Font.GothamSemibold
+HealBtn.TextSize = 12
+HealBtn.Parent = MainFrame
+
+local HealCorner = Instance.new("UICorner")
+HealCorner.CornerRadius = UDim.new(0, 6)
+HealCorner.Parent = HealBtn
+
+local EspBtn = Instance.new("TextButton")
+EspBtn.Size = UDim2.new(1, -20, 0, 36)
+EspBtn.Position = UDim2.new(0, 10, 0, 78)
+EspBtn.BackgroundColor3 = Color3.fromRGB(55, 55, 65)
+EspBtn.Text = "ESP ตำแหน่งศัตรู: ปิด"
+EspBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+EspBtn.Font = Enum.Font.GothamSemibold
+EspBtn.TextSize = 13
+EspBtn.Parent = MainFrame
+
+local EspCorner = Instance.new("UICorner")
+EspCorner.CornerRadius = UDim.new(0, 6)
+EspCorner.Parent = EspBtn
+
+local MeteorBtn = Instance.new("TextButton")
+MeteorBtn.Size = UDim2.new(1, -20, 0, 36)
+MeteorBtn.Position = UDim2.new(0, 10, 0, 120)
+MeteorBtn.BackgroundColor3 = Color3.fromRGB(210, 105, 25)
+MeteorBtn.Text = "ฝนดาวตก (เบาลง - 10 วิ)"
+MeteorBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MeteorBtn.Font = Enum.Font.GothamSemibold
+MeteorBtn.TextSize = 13
+MeteorBtn.Parent = MainFrame
+
+local MeteorCorner = Instance.new("UICorner")
+MeteorCorner.CornerRadius = UDim.new(0, 6)
+MeteorCorner.Parent = MeteorBtn
+
+local NovaAimBtn = Instance.new("TextButton")
+NovaAimBtn.Size = UDim2.new(1, -20, 0, 36)
+NovaAimBtn.Position = UDim2.new(0, 10, 0, 162)
+NovaAimBtn.BackgroundColor3 = Color3.fromRGB(85, 60, 185)
+NovaAimBtn.Text = "เครื่องเล็งซูเปอร์โนวา: ปิด"
+NovaAimBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+NovaAimBtn.Font = Enum.Font.GothamSemibold
+NovaAimBtn.TextSize = 13
+NovaAimBtn.Parent = MainFrame
+
+local NovaAimCorner = Instance.new("UICorner")
+NovaAimCorner.CornerRadius = UDim.new(0, 6)
+NovaAimCorner.Parent = NovaAimBtn
+
+-- แถวปรับระยะเวลาย้อนเวลา (1 - 20 วินาที)
+local MinusBtn = Instance.new("TextButton")
+MinusBtn.Size = UDim2.new(0, 36, 0, 32)
+MinusBtn.Position = UDim2.new(0, 10, 0, 204)
+MinusBtn.BackgroundColor3 = Color3.fromRGB(65, 65, 78)
+MinusBtn.Text = "-"
+MinusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MinusBtn.Font = Enum.Font.GothamBold
+MinusBtn.TextSize = 16
+MinusBtn.Parent = MainFrame
+
+local MinusCorner = Instance.new("UICorner")
+MinusCorner.CornerRadius = UDim.new(0, 6)
+MinusCorner.Parent = MinusBtn
+
+local RewindInput = Instance.new("TextBox")
+RewindInput.Size = UDim2.new(1, -92, 0, 32)
+RewindInput.Position = UDim2.new(0, 50, 0, 204)
+RewindInput.BackgroundColor3 = Color3.fromRGB(42, 42, 50)
+RewindInput.Text = "ย้อนหลัง: " .. tostring(rewindSeconds) .. " วิ (1-20)"
+RewindInput.TextColor3 = Color3.fromRGB(160, 240, 220)
+RewindInput.Font = Enum.Font.GothamSemibold
+RewindInput.TextSize = 12
+RewindInput.ClearTextOnFocus = true
+RewindInput.Parent = MainFrame
+
+local InputCorner = Instance.new("UICorner")
+InputCorner.CornerRadius = UDim.new(0, 6)
+InputCorner.Parent = RewindInput
+
+local PlusBtn = Instance.new("TextButton")
+PlusBtn.Size = UDim2.new(0, 36, 0, 32)
+PlusBtn.Position = UDim2.new(1, -46, 0, 204)
+PlusBtn.BackgroundColor3 = Color3.fromRGB(65, 65, 78)
+PlusBtn.Text = "+"
+PlusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+PlusBtn.Font = Enum.Font.GothamBold
+PlusBtn.TextSize = 16
+PlusBtn.Parent = MainFrame
+
+local PlusCorner = Instance.new("UICorner")
+PlusCorner.CornerRadius = UDim.new(0, 6)
+PlusCorner.Parent = PlusBtn
+
+local function refreshRewindText()
+	RewindInput.Text = "ย้อนหลัง: " .. tostring(rewindSeconds) .. " วิ (1-20)"
+end
+
+local function setRewindSeconds(val)
+	local num = tonumber(val)
+	if not num then
+		refreshRewindText()
+		return
+	end
+	rewindSeconds = math.clamp(math.floor(num), 1, 20)
+	refreshRewindText()
+end
+
+MinusBtn.MouseButton1Click:Connect(function()
+	setRewindSeconds(rewindSeconds - 1)
+end)
+
+PlusBtn.MouseButton1Click:Connect(function()
+	setRewindSeconds(rewindSeconds + 1)
+end)
+
+RewindInput.FocusLost:Connect(function()
+	setRewindSeconds(RewindInput.Text)
+end)
+
+local RewindBtn = Instance.new("TextButton")
+RewindBtn.Size = UDim2.new(1, -20, 0, 36)
+RewindBtn.Position = UDim2.new(0, 10, 0, 242)
+RewindBtn.BackgroundColor3 = Color3.fromRGB(25, 135, 145)
+RewindBtn.Text = "ย้อนเวลา (Turn back time)"
+RewindBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+RewindBtn.Font = Enum.Font.GothamSemibold
+RewindBtn.TextSize = 13
+RewindBtn.Parent = MainFrame
+
+local RewindCorner = Instance.new("UICorner")
+RewindCorner.CornerRadius = UDim.new(0, 6)
+RewindCorner.Parent = RewindBtn
+
+local RefreshBtn = Instance.new("TextButton")
+RefreshBtn.Size = UDim2.new(1, -20, 0, 36)
+RefreshBtn.Position = UDim2.new(0, 10, 0, 284)
+RefreshBtn.BackgroundColor3 = Color3.fromRGB(45, 110, 180)
+RefreshBtn.Text = "รีเฟรช ESP"
+RefreshBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+RefreshBtn.Font = Enum.Font.GothamSemibold
+RefreshBtn.TextSize = 13
+RefreshBtn.Parent = MainFrame
+
+local RefreshCorner = Instance.new("UICorner")
+RefreshCorner.CornerRadius = UDim.new(0, 6)
+RefreshCorner.Parent = RefreshBtn
+
+ModeBtn.Mous
